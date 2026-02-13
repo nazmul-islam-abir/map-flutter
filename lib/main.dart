@@ -3,6 +3,9 @@ import 'package:geolocator/geolocator.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'dart:math' as math; // Add this with other imports
 
 void main() {
   runApp(const MyApp());
@@ -14,7 +17,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Location Tracker Pro',
+      title: 'Chittagong Route Finder',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.blue,
@@ -38,15 +41,29 @@ class _LocationScreenState extends State<LocationScreen> {
   String _status = "Checking location...";
   bool _loading = true;
   bool _isFollowing = true;
-  int _mapStyleIndex = 0; // 0: Streets, 1: Satellite, 2: Outdoor, 3: Hybrid
+  int _mapStyleIndex = 0;
+  
+  // Route related variables
+  List<LatLng> _routePoints = [];
+  bool _isRouteMode = false;
+  bool _isLoadingRoute = false;
+  String _routeInfo = "";
+  String _transportInfo = "";
+  
+  // Source and destination for demo (Chittagong coordinates - approximate)
+  final LatLng _chunaFactory = const LatLng(22.3569, 91.7832); // Chunafactory area
+  final LatLng _newMarket = const LatLng(22.3355, 91.8327); // New Market area
   
   // Stream subscription for location updates
   StreamSubscription<Position>? _positionStreamSubscription;
   
-  // 🔴 REPLACE THIS WITH YOUR ACTUAL MAPTILER API KEY
+  // 🔴 REPLACE WITH YOUR MAPTILER API KEY
   static const String mapTilerKey = "ED7184GhWjoFh4jIu1hx";
   
-  // Different map styles from Maptiler - FIXED: Separated icon from map data
+  // OpenRouteService API key (free, sign up at openrouteservice.org)
+  static const String orsApiKey = "5b3ce3597851110001cf6248f0d1b5c2c0e34e24a7b3e2f9c9d8b7a6c"; // Demo key - replace with yours
+  
+  // Different map styles
   final List<Map<String, dynamic>> mapStyles = [
     {
       'name': 'Streets',
@@ -58,17 +75,16 @@ class _LocationScreenState extends State<LocationScreen> {
       'url': 'https://api.maptiler.com/maps/satellite/{z}/{x}/{y}.jpg?key=',
       'icon': Icons.satellite,
     },
-    {
-      'name': 'Outdoor',
-      'url': 'https://api.maptiler.com/maps/outdoor/{z}/{x}/{y}.png?key=',
-      'icon': Icons.terrain,
-    },
-    {
-      'name': 'Hybrid',
-      'url': 'https://api.maptiler.com/maps/hybrid/{z}/{x}/{y}.jpg?key=',
-      'icon': Icons.layers,
-    },
   ];
+
+  // Chittagong local transport database
+  final Map<String, List<Map<String, dynamic>>> localRoutes = {
+    'chunafactory_newmarket': [
+      {'vehicle': 'CNG (3 No. Tempo)', 'fare': '30-40 tk', 'time': '20-25 mins', 'icon': Icons.electric_rickshaw},
+      {'vehicle': 'Mini Bus', 'fare': '15 tk', 'time': '30-35 mins', 'icon': Icons.directions_bus},
+      {'vehicle': 'Rickshaw', 'fare': '50-60 tk', 'time': '25-30 mins', 'icon': Icons.pedal_bike},
+    ],
+  };
 
   @override
   void initState() {
@@ -110,7 +126,6 @@ class _LocationScreenState extends State<LocationScreen> {
 
   Future<void> _getCurrentLocation() async {
     try {
-      // Force a fresh location with timeout
       Position pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.best,
         timeLimit: const Duration(seconds: 10),
@@ -124,7 +139,7 @@ class _LocationScreenState extends State<LocationScreen> {
 
       _mapController.move(
         LatLng(pos.latitude, pos.longitude),
-        17, // Increased zoom for better detail
+        14,
       );
 
       _listenToLocationUpdates();
@@ -137,70 +152,165 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   void _listenToLocationUpdates() {
-    // Cancel any existing subscription
     _positionStreamSubscription?.cancel();
     
     const settings = LocationSettings(
-      accuracy: LocationAccuracy.best, // Changed to best for more frequent updates
-      distanceFilter: 5, // Reduced to 5 meters for smoother updates
+      accuracy: LocationAccuracy.best,
+      distanceFilter: 5,
     );
 
     _positionStreamSubscription = Geolocator.getPositionStream(locationSettings: settings)
         .listen((Position pos) {
-      print("Location updated: ${pos.latitude}, ${pos.longitude}"); // For debugging
-      
       setState(() {
         _position = pos;
       });
       
-      if (_isFollowing) {
+      if (_isFollowing && !_isRouteMode) {
         _mapController.move(
           LatLng(pos.latitude, pos.longitude),
-          _mapController.camera.zoom, // Keep current zoom level
+          _mapController.camera.zoom,
         );
       }
     });
   }
 
-  // Force location refresh
-  Future<void> _refreshLocation() async {
+  // Get route from OpenRouteService
+  Future<void> _getRoute(LatLng start, LatLng end) async {
     setState(() {
-      _loading = true;
-      _status = "Refreshing location...";
+      _isLoadingRoute = true;
+      _routeInfo = "Finding route...";
     });
-    
+
     try {
-      Position pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.best,
-        timeLimit: const Duration(seconds: 10),
-      );
+      // OpenRouteService API endpoint
+      final url = Uri.parse('https://api.openrouteservice.org/v2/directions/driving-car/geojson');
       
-      setState(() {
-        _position = pos;
-        _loading = false;
-      });
-      
-      _mapController.move(
-        LatLng(pos.latitude, pos.longitude),
-        _mapController.camera.zoom,
+      final response = await http.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImNlMjJiNDJlM2RmZjQ1NGRiNjM0YzI3MzA1MzIyMWM5IiwiaCI6Im11cm11cjY0In0=",
+        },
+        body: json.encode({
+          'coordinates': [
+            [start.longitude, start.latitude],
+            [end.longitude, end.latitude],
+          ],
+        }),
       );
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Location refreshed!'),
-          duration: Duration(seconds: 1),
-          backgroundColor: Colors.green,
-        ),
-      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        
+        // Parse route coordinates
+        final coordinates = data['features'][0]['geometry']['coordinates'] as List;
+        List<LatLng> points = [];
+        
+        for (var coord in coordinates) {
+          points.add(LatLng(coord[1], coord[0])); // GeoJSON is [lng, lat]
+        }
+        
+        // Get route summary
+        final summary = data['features'][0]['properties']['summary'];
+        final distance = (summary['distance'] / 1000).toStringAsFixed(1); // km
+        final duration = (summary['duration'] / 60).toInt(); // minutes
+        
+        setState(() {
+          _routePoints = points;
+          _isRouteMode = true;
+          _isLoadingRoute = false;
+          _routeInfo = "📍 Chunafactory → New Market\n📏 $distance km | 🕒 $duration mins";
+          _transportInfo = _getLocalTransportInfo();
+        });
+        
+        // Zoom to show route
+        _zoomToRouteBounds(start, end);
+        
+      } else {
+        throw Exception('Failed to get route: ${response.statusCode}');
+      }
     } catch (e) {
       setState(() {
-        _loading = false;
+        _isLoadingRoute = false;
+        _routeInfo = "Using local route info";
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Failed to refresh: $e'),
-          backgroundColor: Colors.red,
-        ),
+      
+      // Fallback: Show straight line
+      setState(() {
+        _routePoints = [start, end];
+        _isRouteMode = true;
+        _transportInfo = _getLocalTransportInfo();
+      });
+      
+      _zoomToRouteBounds(start, end);
+    }
+  }
+
+  // Zoom to show the entire route
+  void _zoomToRouteBounds(LatLng start, LatLng end) {
+    // Calculate center point
+    final centerLat = (start.latitude + end.latitude) / 2;
+    final centerLng = (start.longitude + end.longitude) / 2;
+    
+    // Calculate distance to determine zoom level
+    final distance = _calculateDistance(start, end);
+    
+    // Set zoom based on distance
+    double zoom = 12; // Default
+    if (distance < 2) zoom = 14;
+    else if (distance < 5) zoom = 13;
+    else if (distance < 10) zoom = 12;
+    else zoom = 11;
+    
+    _mapController.move(
+      LatLng(centerLat, centerLng),
+      zoom,
+    );
+  }
+
+  // Calculate distance between two points (km)
+  // Calculate distance between two points (km) - FIXED
+    double _calculateDistance(LatLng start, LatLng end) {
+      const double R = 6371; // Earth's radius in km
+      final dLat = _degToRad(end.latitude - start.latitude);
+      final dLon = _degToRad(end.longitude - start.longitude);
+      
+      final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+                math.cos(_degToRad(start.latitude)) * 
+                math.cos(_degToRad(end.latitude)) * 
+                math.sin(dLon / 2) * math.sin(dLon / 2);
+                
+      final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+      return R * c;
+    }
+
+  double _degToRad(double deg) => deg * (3.14159 / 180);
+
+  // Get local transport information
+  String _getLocalTransportInfo() {
+    final routes = localRoutes['chunafactory_newmarket'];
+    if (routes == null) return "Local transport info not available";
+    
+    String info = "";
+    for (var route in routes) {
+      info += "• ${route['vehicle']}: ${route['fare']} (${route['time']})\n";
+    }
+    return info;
+  }
+
+  // Clear route
+  void _clearRoute() {
+    setState(() {
+      _routePoints = [];
+      _isRouteMode = false;
+      _routeInfo = "";
+      _transportInfo = "";
+    });
+    
+    if (_position != null) {
+      _mapController.move(
+        LatLng(_position!.latitude, _position!.longitude),
+        14,
       );
     }
   }
@@ -209,7 +319,7 @@ class _LocationScreenState extends State<LocationScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("📍 Live Location Tracker"),
+        title: const Text("📍 Chittagong Route Finder"),
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
         actions: [
@@ -241,18 +351,14 @@ class _LocationScreenState extends State<LocationScreen> {
                   ),
               ],
             ),
+          // Route button
           if (_position != null)
             IconButton(
-              icon: Icon(_isFollowing ? Icons.follow_the_signs : Icons.pan_tool),
-              onPressed: () {
-                setState(() => _isFollowing = !_isFollowing);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text(_isFollowing ? 'Auto-follow ON' : 'Auto-follow OFF'),
-                    duration: const Duration(seconds: 1),
-                  ),
-                );
-              },
+              icon: Icon(_isRouteMode ? Icons.close : Icons.route),
+              onPressed: _isRouteMode 
+                  ? _clearRoute 
+                  : () => _getRoute(_chunaFactory, _newMarket),
+              tooltip: _isRouteMode ? 'Clear route' : 'Show Chunafactory → New Market',
             ),
         ],
       ),
@@ -288,7 +394,7 @@ class _LocationScreenState extends State<LocationScreen> {
                 )
               : Stack(
                   children: [
-                    // Map with selected style
+                    // Map
                     FlutterMap(
                       mapController: _mapController,
                       options: MapOptions(
@@ -296,7 +402,7 @@ class _LocationScreenState extends State<LocationScreen> {
                           _position!.latitude,
                           _position!.longitude,
                         ),
-                        initialZoom: 17, // Higher zoom for better detail
+                        initialZoom: 14,
                         maxZoom: 20,
                         minZoom: 3,
                       ),
@@ -304,11 +410,24 @@ class _LocationScreenState extends State<LocationScreen> {
                         TileLayer(
                           urlTemplate: (mapStyles[_mapStyleIndex]['url'] as String) + mapTilerKey,
                           userAgentPackageName: "com.example.myapp",
-                          tileProvider: NetworkTileProvider(), // Ensures fresh tiles
                         ),
 
+                        // Route line
+                        if (_routePoints.isNotEmpty)
+                          PolylineLayer(
+                            polylines: [
+                              Polyline(
+                                points: _routePoints,
+                                color: Colors.blue,
+                                strokeWidth: 6,
+                              ),
+                            ],
+                          ),
+
+                        // Markers
                         MarkerLayer(
                           markers: [
+                            // Current location
                             Marker(
                               width: 60,
                               height: 60,
@@ -322,12 +441,58 @@ class _LocationScreenState extends State<LocationScreen> {
                                   shape: BoxShape.circle,
                                 ),
                                 child: const Icon(
-                                  Icons.navigation, // Changed to navigation icon for better visibility
+                                  Icons.navigation,
                                   color: Colors.blue,
                                   size: 40,
                                 ),
                               ),
                             ),
+                            
+                            // Chunafactory marker
+                            if (_isRouteMode)
+                              Marker(
+                                width: 50,
+                                height: 50,
+                                point: _chunaFactory,
+                                child: Container(
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: Colors.red,
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(color: Colors.white, width: 2),
+                                  ),
+                                  child: const Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.factory, color: Colors.white, size: 20),
+                                      Text('Start', style: TextStyle(color: Colors.white, fontSize: 8)),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            
+                            // New Market marker
+                            if (_isRouteMode)
+                              Marker(
+                                width: 50,
+                                height: 50,
+                                point: _newMarket,
+                                child: Container(
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: Colors.green,
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(color: Colors.white, width: 2),
+                                  ),
+                                  child: const Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.store, color: Colors.white, size: 20),
+                                      Text('End', style: TextStyle(color: Colors.white, fontSize: 8)),
+                                    ],
+                                  ),
+                                ),
+                              ),
                           ],
                         ),
 
@@ -349,9 +514,141 @@ class _LocationScreenState extends State<LocationScreen> {
                       ],
                     ),
 
-                    // Live indicator with timestamp
+                    // Loading indicator
+                    if (_isLoadingRoute)
+                      const Positioned(
+                        top: 16,
+                        left: 0,
+                        right: 0,
+                        child: Center(
+                          child: Card(
+                            child: Padding(
+                              padding: EdgeInsets.all(16),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  CircularProgressIndicator(),
+                                  SizedBox(width: 16),
+                                  Text('Finding best route...'),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+
+                    // Route info card
+                    if (_isRouteMode && !_isLoadingRoute)
+                      Positioned(
+                        top: 16,
+                        left: 16,
+                        right: 16,
+                        child: Card(
+                          elevation: 8,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: [Colors.blue.shade50, Colors.white],
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.all(8),
+                                      decoration: const BoxDecoration(
+                                        color: Colors.blue,
+                                        shape: BoxShape.circle,
+                                      ),
+                                      child: const Icon(Icons.route, color: Colors.white, size: 20),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    const Expanded(
+                                      child: Text(
+                                        'Route Information',
+                                        style: TextStyle(
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.close, size: 20),
+                                      onPressed: _clearRoute,
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(),
+                                    ),
+                                  ],
+                                ),
+                                const Divider(height: 20),
+                                Text(
+                                  _routeInfo,
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: Colors.amber.withOpacity(0.1),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: Colors.amber.withOpacity(0.3)),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        '🚖 Local Transport:',
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.amber,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(_transportInfo),
+                                      const SizedBox(height: 8),
+                                      Container(
+                                        padding: const EdgeInsets.all(8),
+                                        decoration: BoxDecoration(
+                                          color: Colors.green.withOpacity(0.1),
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: const Row(
+                                          children: [
+                                            Icon(Icons.info, color: Colors.green, size: 20),
+                                            SizedBox(width: 8),
+                                            Expanded(
+                                              child: Text(
+                                                '👉 Can go using 3 No. Tempo (CNG)',
+                                                style: TextStyle(
+                                                  fontWeight: FontWeight.bold,
+                                                  color: Colors.green,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+
+                    // Live indicator
                     Positioned(
-                      top: 16,
+                      bottom: 100,
                       left: 16,
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -385,172 +682,71 @@ class _LocationScreenState extends State<LocationScreen> {
                       ),
                     ),
 
-                    // Refresh button
-                    Positioned(
-                      top: 16,
-                      right: 16,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(30),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.1),
-                              blurRadius: 4,
-                            ),
-                          ],
-                        ),
-                        child: IconButton(
-                          icon: const Icon(Icons.refresh, color: Colors.blue),
-                          onPressed: _refreshLocation,
-                        ),
-                      ),
-                    ),
-
-                    // Map style indicator
-                    Positioned(
-                      top: 70,
-                      right: 16,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(20),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.1),
-                              blurRadius: 4,
-                            ),
-                          ],
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(mapStyles[_mapStyleIndex]['icon'] as IconData, size: 14, color: Colors.blue),
-                            const SizedBox(width: 4),
-                            Text(
-                              mapStyles[_mapStyleIndex]['name'] as String,
-                              style: const TextStyle(fontSize: 12),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    // Bottom info card with better info
-                    Positioned(
-                      bottom: 20,
-                      left: 16,
-                      right: 16,
-                      child: Card(
-                        elevation: 8,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
+                    // Bottom info card
+                    if (!_isRouteMode)
+                      Positioned(
+                        bottom: 20,
+                        left: 16,
+                        right: 16,
+                        child: Card(
+                          elevation: 8,
+                          shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(20),
-                            gradient: LinearGradient(
-                              colors: [Colors.white, Colors.blue.shade50],
-                            ),
                           ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  const Icon(Icons.location_on, color: Colors.blue),
-                                  const SizedBox(width: 8),
-                                  const Text(
-                                    'Your Location',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                    decoration: BoxDecoration(
-                                      color: _position!.accuracy < 10 ? Colors.green : Colors.orange,
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                    child: Text(
-                                      _position!.accuracy < 10 ? 'High accuracy' : 'Medium accuracy',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 10,
+                          child: Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(20),
+                              gradient: LinearGradient(
+                                colors: [Colors.white, Colors.blue.shade50],
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Icon(Icons.location_on, color: Colors.blue),
+                                    const SizedBox(width: 8),
+                                    const Text(
+                                      'Your Location',
+                                      style: TextStyle(
+                                        fontSize: 18,
                                         fontWeight: FontWeight.bold,
                                       ),
                                     ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: _buildInfoChip(
-                                      Icons.north,
-                                      'Latitude',
-                                      _position!.latitude.toStringAsFixed(6),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: _buildInfoChip(
-                                      Icons.east,
-                                      'Longitude',
-                                      _position!.longitude.toStringAsFixed(6),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: _buildInfoChip(
-                                      Icons.radar,
-                                      'Accuracy',
-                                      '${_position!.accuracy.toStringAsFixed(1)} m',
-                                      color: _position!.accuracy < 10 ? Colors.green : Colors.orange,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: _buildInfoChip(
-                                      Icons.speed,
-                                      'Speed',
-                                      _position!.speed > 0 
-                                          ? '${(_position!.speed * 3.6).toStringAsFixed(1)} km/h' 
-                                          : '0 km/h',
-                                      color: Colors.green,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              if (_position!.timestamp != null) ...[
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    Icon(Icons.access_time, size: 14, color: Colors.grey.shade600),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      'Updated: ${_formatTime(_position!.timestamp!)}',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.grey.shade600,
+                                    const Spacer(),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: _position!.accuracy < 10 ? Colors.green : Colors.orange,
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Text(
+                                        _position!.accuracy < 10 ? 'High' : 'Medium',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold,
+                                        ),
                                       ),
                                     ),
                                   ],
                                 ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Lat: ${_position!.latitude.toStringAsFixed(6)}',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                                Text(
+                                  'Lng: ${_position!.longitude.toStringAsFixed(6)}',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
                               ],
-                            ],
+                            ),
                           ),
                         ),
                       ),
-                    ),
                   ],
                 ),
       floatingActionButton: _position == null
@@ -581,51 +777,23 @@ class _LocationScreenState extends State<LocationScreen> {
                 FloatingActionButton(
                   heroTag: 'center',
                   onPressed: () {
-                    _mapController.move(
-                      LatLng(_position!.latitude, _position!.longitude),
-                      17,
-                    );
-                    setState(() => _isFollowing = true);
+                    if (_isRouteMode && _routePoints.isNotEmpty) {
+                      // Center on route
+                      final start = _routePoints.first;
+                      final end = _routePoints.last;
+                      _zoomToRouteBounds(start, end);
+                    } else {
+                      // Center on current location
+                      _mapController.move(
+                        LatLng(_position!.latitude, _position!.longitude),
+                        14,
+                      );
+                    }
                   },
-                  child: const Icon(Icons.my_location),
+                  child: Icon(_isRouteMode ? Icons.center_focus_strong : Icons.my_location),
                 ),
               ],
             ),
-    );
-  }
-
-  Widget _buildInfoChip(IconData icon, String label, String value, {Color color = Colors.blue}) {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withOpacity(0.3)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, size: 14, color: color),
-              const SizedBox(width: 4),
-              Text(
-                label,
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
-              ),
-            ],
-          ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              color: color,
-            ),
-          ),
-        ],
-      ),
     );
   }
 
